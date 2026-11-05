@@ -1,0 +1,110 @@
+sentry:
+    dsn: https://examplePublicKey@o0.ingest.sentry.io/0
+    logger: app.logger
+    options:
+        integrations:
+            - App\Sentry\Integration\FooIntegration
+            - Sentry\Integration\OTLPIntegration
+        default_integrations: false
+        prefixes:
+            - '%kernel.project_dir%'
+        sample_rate: 1
+        enable_tracing: true
+        traces_sample_rate: 1
+        traces_sampler: App\Sentry\Tracing\TracesSampler
+        profiles_sample_rate: 1
+        enable_logs: true
+        log_flush_threshold: 2
+        attach_stacktrace: true
+        attach_metric_code_locations: true
+        context_lines: 0
+        environment: development
+        logger: Sentry\Logger\DebugStdOutLogger
+        spotlight: true
+        spotlight_url: http://localhost:8969
+        release: 4.0.x-dev
+        org_id: 1
+        server_name: localhost
+        ignore_exceptions:
+            - Symfony\Component\HttpKernel\Exception\BadRequestHttpException
+        ignore_transactions:
+            - GET tracing_ignored_transaction
+        before_send: App\Sentry\BeforeSendCallback
+        before_send_transaction: App\Sentry\BeforeSendTransactionCallback
+        before_send_check_in: App\Sentry\BeforeSendCheckInCallback
+        before_send_metrics: App\Sentry\BeforeSendMetricsCallback
+        before_send_log: App\Sentry\BeforeSendLogsCallback
+        trace_propagation_targets:
+          - 'website.invalid'
+        strict_trace_continuation: true
+        tags:
+            context: development
+        error_types: !php/const E_ALL
+        max_breadcrumbs: 1
+        before_breadcrumb: App\Sentry\BeforeBreadcrumbCallback
+        in_app_exclude:
+            - '%kernel.cache_dir%'
+        in_app_include:
+            - '%kernel.project_dir%'
+        send_default_pii: true
+        data_collection:
+            user_info: false
+            cookies:
+                mode: allowList
+                terms:
+                    - theme
+            http_headers:
+                request:
+                    mode: denyList
+                    terms:
+                        - x-forwarded-for
+                response:
+                    mode: off
+            http_bodies:
+                - incomingRequest
+                - outgoingRequest
+            url_query_params:
+                terms:
+                    - email
+            gen_ai:
+                inputs: false
+                outputs: true
+            database_query_data: false
+            queues: false
+            stack_frame_variables:
+                mode: allowList
+                terms:
+                    - id
+            frame_context_lines: 3
+        max_value_length: 255
+        transport: App\Sentry\Transport
+        http_client: App\Sentry\HttpClient
+        http_proxy: proxy.example.com:8080
+        http_proxy_authentication: user:password
+        http_connect_timeout: 15
+        http_timeout: 10
+        http_ssl_verify_peer: true
+        http_compression: true
+        capture_silenced_errors: true
+        max_request_body_size: 'none'
+        class_serializers:
+            App\FooClass: App\Sentry\Serializer\FooClassSerializer
+    messenger:
+        enabled: true
+        capture_soft_fails: false
+        isolate_breadcrumbs_by_message: true
+        isolate_context_by_message: true
+    tracing:
+        dbal:
+            enabled: false
+            connections:
+                - default
+        twig:
+            enabled: false
+        cache:
+            enabled: false
+        http_client:
+            enabled: false
+        console:
+            excluded_commands:
+              - app:command

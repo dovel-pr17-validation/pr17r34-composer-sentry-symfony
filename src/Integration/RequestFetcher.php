@@ -1,0 +1,97 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Sentry\SentryBundle\Integration;
+
+use GuzzleHttp\Psr7\HttpFactory;
+use Psr\Http\Message\ServerRequestInterface;
+use Sentry\Integration\RequestFetcherInterface;
+use Symfony\Bridge\PsrHttpMessage\Factory\PsrHttpFactory;
+use Symfony\Bridge\PsrHttpMessage\HttpMessageFactoryInterface;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\RequestStack;
+use Symfony\Contracts\Service\ResetInterface;
+
+/**
+ * This class fetches the server request from the request stack and converts it
+ * into a PSR-7 request that is suitable to be used by the {@see \Sentry\Integration\RequestIntegration}
+ * integration.
+ */
+final class RequestFetcher implements RequestFetcherInterface, ResetInterface
+{
+    /**
+     * @var RequestStack The request stack
+     */
+    private $requestStack;
+
+    /**
+     * @var Request|null The current request
+     */
+    private $currentRequest;
+
+    /**
+     * @var HttpMessageFactoryInterface The factory to convert Symfony requests to PSR-7 requests
+     */
+    private $httpMessageFactory;
+
+    /**
+     * Class constructor.
+     *
+     * @param RequestStack                     $requestStack       The request stack
+     * @param HttpMessageFactoryInterface|null $httpMessageFactory The factory to convert Symfony requests to PSR-7 requests
+     */
+    public function __construct(RequestStack $requestStack, ?HttpMessageFactoryInterface $httpMessageFactory = null)
+    {
+        $this->requestStack = $requestStack;
+        $this->httpMessageFactory = $httpMessageFactory ?? new PsrHttpFactory(
+            new HttpFactory(),
+            new HttpFactory(),
+            new HttpFactory(),
+            new HttpFactory()
+        );
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function fetchRequest(): ?ServerRequestInterface
+    {
+        $request = $this->currentRequest ?? $this->requestStack->getCurrentRequest();
+
+        if (null === $request) {
+            return null;
+        }
+
+        try {
+            $serverRequest = $this->httpMessageFactory->createRequest($request);
+
+            // Return the request with a null body in case it is empty so that we can
+            // still inspect the raw body
+            if ([] === $serverRequest->getParsedBody() && !self::isFormRequest($request)) {
+                return $serverRequest->withParsedBody(null);
+            }
+
+            return $serverRequest;
+        } catch (\Throwable $exception) {
+            return null;
+        }
+    }
+
+    public function setRequest(?Request $request): void
+    {
+        $this->currentRequest = $request;
+    }
+
+    public function reset(): void
+    {
+        $this->setRequest(null);
+    }
+
+    private static function isFormRequest(Request $request): bool
+    {
+        $mediaType = strtolower(trim(explode(';', (string) $request->headers->get('Content-Type', ''), 2)[0]));
+
+        return 'application/x-www-form-urlencoded' === $mediaType || 'multipart/form-data' === $mediaType;
+    }
+}

@@ -1,0 +1,116 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Sentry\SentryBundle\Tests\Tracing\Doctrine\DBAL;
+
+use Doctrine\DBAL\Driver\Connection;
+use Doctrine\DBAL\Platforms\AbstractMySQLPlatform;
+use Doctrine\DBAL\Platforms\AbstractPlatform;
+use Doctrine\DBAL\Platforms\DB2Platform;
+use Doctrine\DBAL\Platforms\MySqlPlatform;
+use Doctrine\DBAL\Platforms\OraclePlatform;
+use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
+use Doctrine\DBAL\Platforms\SqlitePlatform;
+use Doctrine\DBAL\Platforms\SQLServerPlatform;
+use PHPUnit\Framework\MockObject\MockObject;
+use Sentry\SentryBundle\Tests\DoctrineTestCase;
+use Sentry\SentryBundle\Tracing\Doctrine\DBAL\TracingDriverConnectionFactory;
+use Sentry\SentryBundle\Tracing\Doctrine\DBAL\TracingDriverConnectionForV2V3;
+use Sentry\State\HubInterface;
+
+final class TracingDriverConnectionFactoryV2Test extends DoctrineTestCase
+{
+    /**
+     * @var MockObject&HubInterface
+     */
+    private $hub;
+
+    /**
+     * @var MockObject&AbstractPlatform
+     */
+    private $databasePlatform;
+
+    /**
+     * @var TracingDriverConnectionFactory
+     */
+    private $tracingDriverConnectionFactory;
+
+    public static function setUpBeforeClass(): void
+    {
+        if (!self::isDoctrineDBALVersion2Installed()) {
+            self::markTestSkipped('This test requires the "doctrine/dbal: ^2.13" Composer package.');
+        }
+    }
+
+    protected function setUp(): void
+    {
+        $this->hub = $this->createMock(HubInterface::class);
+        $this->databasePlatform = $this->createMock(AbstractPlatform::class);
+        $this->tracingDriverConnectionFactory = new TracingDriverConnectionFactory($this->hub);
+    }
+
+    /**
+     * @dataProvider createDataProvider
+     *
+     * @param class-string<AbstractPlatform> $databasePlatformFqcn
+     */
+    public function testCreate(string $databasePlatformFqcn, string $expectedDatabasePlatform): void
+    {
+        $connection = $this->createMock(Connection::class);
+        $databasePlatform = $this->createMock($databasePlatformFqcn);
+        $driverConnection = $this->tracingDriverConnectionFactory->create($connection, $databasePlatform, []);
+        $expectedDriverConnection = new TracingDriverConnectionForV2V3($this->hub, $connection, $expectedDatabasePlatform, []);
+
+        $this->assertEquals($expectedDriverConnection, $driverConnection);
+    }
+
+    public function testCreateCanIgnorePrepareSpans(): void
+    {
+        $connection = $this->createMock(Connection::class);
+        $databasePlatform = $this->createMock(AbstractPlatform::class);
+        $tracingDriverConnectionFactory = new TracingDriverConnectionFactory($this->hub, true);
+        $driverConnection = $tracingDriverConnectionFactory->create($connection, $databasePlatform, []);
+        $expectedDriverConnection = new TracingDriverConnectionForV2V3($this->hub, $connection, 'other_sql', [], true);
+
+        $this->assertEquals($expectedDriverConnection, $driverConnection);
+    }
+
+    public static function createDataProvider(): \Generator
+    {
+        yield [
+            class_exists(AbstractMySQLPlatform::class) ? AbstractMySQLPlatform::class : MySqlPlatform::class,
+            'mysql',
+        ];
+
+        yield [
+            DB2Platform::class,
+            'db2',
+        ];
+
+        yield [
+            OraclePlatform::class,
+            'oracle',
+        ];
+
+        yield [
+            class_exists(PostgreSQLPlatform::class) ? PostgreSQLPlatform::class : 'Doctrine\\DBAL\\Platforms\\PostgreSqlPlatform',
+            'postgresql',
+        ];
+
+        yield [
+            SqlitePlatform::class,
+            'sqlite',
+        ];
+
+        yield [
+            SQLServerPlatform::class,
+            'mssql',
+        ];
+
+        yield [
+            AbstractPlatform::class,
+            'other_sql',
+        ];
+    }
+}

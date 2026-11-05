@@ -1,0 +1,44 @@
+services:
+  _defaults:
+    autoconfigure: true
+
+  Sentry\SentryBundle\Tests\End2End\App\Messenger\StaticInMemoryTransportFactory:
+    class: \Sentry\SentryBundle\Tests\End2End\App\Messenger\StaticInMemoryTransportFactory
+
+  Sentry\SentryBundle\Tests\End2End\App\Messenger\FooMessageHandler:
+    autowire: true
+    class: \Sentry\SentryBundle\Tests\End2End\App\Messenger\FooMessageHandler
+    tags:
+      - { name: messenger.message_handler }
+
+  Sentry\SentryBundle\Tests\End2End\App\Controller\MessengerController:
+    autowire: true
+    tags:
+      - controller.service_arguments
+
+  Sentry\Monolog\BreadcrumbHandler:
+    arguments:
+      - '@Sentry\State\HubInterface'
+      - !php/const Monolog\Logger::WARNING
+
+monolog:
+  handlers:
+    sentry_breadcrumbs:
+      type: service
+      name: sentry_breadcrumbs
+      id: Sentry\Monolog\BreadcrumbHandler
+
+framework:
+  messenger:
+    transports:
+      async:
+        dsn: 'static://'
+        retry_strategy:
+          max_retries: 1
+    routing:
+      '*': async
+
+sentry:
+  messenger:
+    capture_soft_fails: false
+    isolate_breadcrumbs_by_message: true

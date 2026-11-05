@@ -1,0 +1,362 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Sentry\SentryBundle\DependencyInjection;
+
+use Doctrine\Bundle\DoctrineBundle\DoctrineBundle;
+use Sentry\DataCollection\HttpMessageType;
+use Sentry\DataCollection\KeyValueCollectionBehavior;
+use Sentry\SentryBundle\ErrorTypesParser;
+use Symfony\Bundle\TwigBundle\TwigBundle;
+use Symfony\Component\Cache\CacheItem;
+use Symfony\Component\Config\Definition\Builder\ArrayNodeDefinition;
+use Symfony\Component\Config\Definition\Builder\NodeParentInterface;
+use Symfony\Component\Config\Definition\Builder\TreeBuilder;
+use Symfony\Component\Config\Definition\ConfigurationInterface;
+use Symfony\Component\HttpClient\HttpClient;
+use Symfony\Component\HttpKernel\Kernel;
+use Symfony\Component\Messenger\MessageBusInterface;
+
+final class Configuration implements ConfigurationInterface
+{
+    /**
+     * {@inheritdoc}
+     *
+     * @phpstan-return TreeBuilder<'array'>
+     */
+    public function getConfigTreeBuilder(): TreeBuilder
+    {
+        $treeBuilder = new TreeBuilder('sentry');
+
+        /** @phpstan-var ArrayNodeDefinition<NodeParentInterface|null> $rootNode */
+        $rootNode = method_exists(TreeBuilder::class, 'getRootNode')
+            ? $treeBuilder->getRootNode()
+            : $treeBuilder->root('sentry');
+
+        $inAppExcludes = [
+            '%kernel.cache_dir%',
+            '%kernel.project_dir%/vendor',
+        ];
+
+        if (Kernel::VERSION_ID >= 50200) {
+            $inAppExcludes[] = '%kernel.build_dir%';
+        }
+
+        // @phpstan-ignore-next-line
+        $rootNode
+            ->children()
+                ->scalarNode('dsn')
+                    ->info('If this value is not provided, the SDK will try to read it from the SENTRY_DSN environment variable. If that variable also does not exist, the SDK will not send any events.')
+                ->end()
+                ->booleanNode('register_error_listener')->defaultTrue()->end()
+                ->booleanNode('register_error_handler')->defaultTrue()->end()
+                ->booleanNode('register_monolog_handler')
+                    ->info('EXPERIMENT: automatically push a Sentry handler onto every Monolog channel (requires MonologBundle).')
+                    ->defaultFalse()
+                ->end()
+                ->scalarNode('logger')
+                    ->info('The service ID of the PSR-3 logger used to log messages coming from the SDK client. Be aware that setting the same logger of the application may create a circular loop when an event fails to be sent.')
+                    ->defaultNull()
+                ->end()
+                ->arrayNode('options')
+                    ->addDefaultsIfNotSet()
+                    ->fixXmlConfig('integration')
+                    ->fixXmlConfig('trace_propagation_target')
+                    ->fixXmlConfig('tag')
+                    ->fixXmlConfig('class_serializer')
+                    ->fixXmlConfig('ignore_exception')
+                    ->fixXmlConfig('ignore_transaction')
+                    ->fixXmlConfig('prefix', 'prefixes')
+                    ->children()
+                        ->variableNode('integrations')
+                            ->defaultValue([])
+                        ->end()
+                        ->booleanNode('default_integrations')->end()
+                        ->arrayNode('prefixes')
+                            ->defaultValue(array_merge(['%kernel.project_dir%'], array_filter(explode(\PATH_SEPARATOR, get_include_path() ?: ''))))
+                            ->scalarPrototype()->end()
+                        ->end()
+                        ->floatNode('sample_rate')
+                            ->min(0.0)
+                            ->max(1.0)
+                            ->info('The sampling factor to apply to events. A value of 0 will deny sending any event, and a value of 1 will send all events.')
+                        ->end()
+                        ->booleanNode('enable_tracing')->end()
+                        ->floatNode('traces_sample_rate')
+                            ->min(0.0)
+                            ->max(1.0)
+                            ->info('The sampling factor to apply to transactions. A value of 0 will deny sending any transaction, and a value of 1 will send all transactions.')
+                        ->end()
+                        ->scalarNode('traces_sampler')->end()
+                        ->floatNode('profiles_sample_rate')
+                            ->min(0.0)
+                            ->max(1.0)
+                            ->info('The sampling factor to apply to profiles. A value of 0 will deny sending any profiles, and a value of 1 will send all profiles. Profiles are sampled in relation to traces_sample_rate')
+                        ->end()
+                        ->booleanNode('enable_logs')->end()
+                        ->variableNode('log_flush_threshold')->defaultNull()->end()
+                        ->booleanNode('enable_metrics')->defaultTrue()->end()
+                        ->booleanNode('attach_stacktrace')->end()
+                        ->booleanNode('attach_metric_code_locations')->end()
+                        ->integerNode('context_lines')->min(0)->end()
+                        ->scalarNode('environment')
+                            ->cannotBeEmpty()
+                            ->defaultValue('%kernel.environment%')
+                        ->end()
+                        ->scalarNode('logger')->end()
+                        ->booleanNode('spotlight')->end()
+                        ->scalarNode('spotlight_url')->end()
+                        ->scalarNode('release')
+                            ->cannotBeEmpty()
+                            ->defaultValue('%env(default::SENTRY_RELEASE)%')
+                        ->end()
+                        ->integerNode('org_id')->end()
+                        ->scalarNode('server_name')->end()
+                        ->arrayNode('ignore_exceptions')
+                            ->scalarPrototype()->end()
+                            ->beforeNormalization()->castToArray()->end()
+                        ->end()
+                        ->arrayNode('ignore_transactions')
+                            ->scalarPrototype()->end()
+                            ->beforeNormalization()->castToArray()->end()
+                        ->end()
+                        ->scalarNode('before_send')->end()
+                        ->scalarNode('before_send_transaction')->end()
+                        ->scalarNode('before_send_check_in')->end()
+                        ->scalarNode('before_send_metrics')->end()
+                        ->scalarNode('before_send_log')->end()
+                        ->scalarNode('before_send_metric')->end()
+                        ->variableNode('trace_propagation_targets')->end()
+                        ->booleanNode('strict_trace_continuation')->end()
+                        ->arrayNode('tags')
+                            ->useAttributeAsKey('name')
+                            ->normalizeKeys(false)
+                            ->scalarPrototype()->end()
+                        ->end()
+                        ->scalarNode('error_types')
+                            ->beforeNormalization()
+                                ->always(\Closure::fromCallable([ErrorTypesParser::class, 'parse']))
+                            ->end()
+                        ->end()
+                        ->integerNode('max_breadcrumbs')->min(0)->end()
+                        ->variableNode('before_breadcrumb')->end()
+                        ->arrayNode('in_app_exclude')
+                            ->scalarPrototype()->end()
+                            ->beforeNormalization()->castToArray()->end()
+                            ->defaultValue($inAppExcludes)
+                        ->end()
+                        ->arrayNode('in_app_include')
+                            ->scalarPrototype()->end()
+                            ->beforeNormalization()->castToArray()->end()
+                        ->end()
+                        ->booleanNode('send_default_pii')->end()
+                        ->append($this->createDataCollectionNode())
+                        ->integerNode('max_value_length')->min(0)->end()
+                        ->scalarNode('transport')->end()
+                        ->scalarNode('http_client')->end()
+                        ->scalarNode('http_proxy')->end()
+                        ->scalarNode('http_proxy_authentication')->end()
+                        ->floatNode('http_connect_timeout')
+                            ->min(0)
+                            ->info('The maximum number of seconds to wait while trying to connect to a server. It works only when using the default transport.')
+                        ->end()
+                        ->floatNode('http_timeout')
+                            ->min(0)
+                            ->info('The maximum execution time for the request+response as a whole. It works only when using the default transport.')
+                        ->end()
+                        ->booleanNode('http_ssl_verify_peer')->end()
+                        ->booleanNode('http_compression')->end()
+                        ->booleanNode('capture_silenced_errors')->end()
+                        ->enumNode('max_request_body_size')
+                            ->values([
+                                'none',
+                                'never',
+                                'small',
+                                'medium',
+                                'always',
+                            ])
+                        ->end()
+                        ->arrayNode('class_serializers')
+                            ->useAttributeAsKey('class')
+                            ->normalizeKeys(false)
+                            ->scalarPrototype()->end()
+                        ->end()
+                    ->end()
+                ->end()
+            ->end();
+
+        $this->addMessengerSection($rootNode);
+        $this->addDistributedTracingSection($rootNode);
+
+        return $treeBuilder;
+    }
+
+    /**
+     * @phpstan-return ArrayNodeDefinition<null>
+     */
+    private function createDataCollectionNode(): ArrayNodeDefinition
+    {
+        $node = new ArrayNodeDefinition('data_collection');
+
+        // @phpstan-ignore-next-line
+        $node
+            ->info('Opts into the data collection options, which replace legacy options such as "send_default_pii". An empty array applies the default of every option, null keeps the legacy options even if an earlier config file opted in.')
+            // A null value is unset after merging, which keeps the legacy options such as `send_default_pii`
+            // even if an earlier config file opted in. The false value is only used internally for this.
+            ->treatNullLike(false)
+            ->canBeUnset()
+            ->beforeNormalization()
+                ->ifTrue(static function ($value): bool {
+                    return false === $value;
+                })
+                ->thenInvalid('Invalid configuration for path "sentry.options.data_collection": the value %s is not supported, use null to keep the legacy options.')
+            ->end()
+            ->fixXmlConfig('http_body', 'http_bodies')
+            ->children()
+                ->booleanNode('user_info')->end()
+                ->append($this->createKeyValueCollectionNode('cookies'))
+                ->arrayNode('http_headers')
+                    ->beforeNormalization()
+                        // Expand the shorthand that applies the same behavior to requests and responses
+                        ->ifTrue(static function ($value): bool {
+                            return null === $value || (\is_array($value) && !\array_key_exists('request', $value) && !\array_key_exists('response', $value));
+                        })
+                        ->then(static function (?array $value): array {
+                            return [
+                                'request' => $value ?? [],
+                                'response' => $value ?? [],
+                            ];
+                        })
+                    ->end()
+                    ->children()
+                        ->append($this->createKeyValueCollectionNode('request'))
+                        ->append($this->createKeyValueCollectionNode('response'))
+                    ->end()
+                ->end()
+                ->arrayNode('http_bodies')
+                    ->info('The body types to collect. All body types are collected if omitted, an empty list collects none.')
+                    ->performNoDeepMerging()
+                    ->defaultValue(HttpMessageType::TYPES)
+                    ->enumPrototype()->values(HttpMessageType::TYPES)->end()
+                ->end()
+                ->append($this->createKeyValueCollectionNode('url_query_params'))
+                ->arrayNode('gen_ai')
+                    ->children()
+                        ->booleanNode('inputs')->end()
+                        ->booleanNode('outputs')->end()
+                    ->end()
+                ->end()
+                ->booleanNode('database_query_data')->end()
+                ->booleanNode('queues')->end()
+                ->append(
+                    $this->createKeyValueCollectionNode('stack_frame_variables')
+                        ->treatTrueLike(['mode' => KeyValueCollectionBehavior::MODE_DENY_LIST])
+                        ->treatFalseLike(['mode' => KeyValueCollectionBehavior::MODE_OFF])
+                )
+                ->integerNode('frame_context_lines')->min(0)->end()
+            ->end();
+
+        return $node;
+    }
+
+    /**
+     * @phpstan-return ArrayNodeDefinition<null>
+     */
+    private function createKeyValueCollectionNode(string $name): ArrayNodeDefinition
+    {
+        $node = new ArrayNodeDefinition($name);
+
+        // @phpstan-ignore-next-line
+        $node
+            ->fixXmlConfig('term')
+            ->children()
+                ->enumNode('mode')
+                    ->values([
+                        KeyValueCollectionBehavior::MODE_OFF,
+                        KeyValueCollectionBehavior::MODE_DENY_LIST,
+                        KeyValueCollectionBehavior::MODE_ALLOW_LIST,
+                    ])
+                ->end()
+                ->arrayNode('terms')
+                    ->performNoDeepMerging()
+                    ->scalarPrototype()
+                        // The SDK ignores the whole behavior if a term is not a string
+                        ->validate()
+                            ->ifTrue(static function ($value): bool {
+                                return !\is_string($value);
+                            })
+                            ->thenInvalid('Expected a string, but got %s.')
+                        ->end()
+                    ->end()
+                ->end()
+            ->end();
+
+        return $node;
+    }
+
+    /**
+     * @phpstan-param ArrayNodeDefinition<NodeParentInterface|null> $rootNode
+     */
+    private function addMessengerSection(ArrayNodeDefinition $rootNode): void
+    {
+        // @phpstan-ignore-next-line
+        $rootNode
+            ->children()
+                ->arrayNode('messenger')
+                    ->{interface_exists(MessageBusInterface::class) ? 'canBeDisabled' : 'canBeEnabled'}()
+                    ->children()
+                        ->booleanNode('capture_soft_fails')->defaultTrue()->end()
+                        ->booleanNode('isolate_breadcrumbs_by_message')->defaultFalse()->end()
+                        ->booleanNode('isolate_context_by_message')->defaultFalse()->end()
+                    ->end()
+                ->end()
+            ->end();
+    }
+
+    /**
+     * @phpstan-param ArrayNodeDefinition<NodeParentInterface|null> $rootNode
+     */
+    private function addDistributedTracingSection(ArrayNodeDefinition $rootNode): void
+    {
+        // @phpstan-ignore-next-line
+        $rootNode
+            ->children()
+                ->arrayNode('tracing')
+                    ->canBeDisabled()
+                    ->addDefaultsIfNotSet()
+                    ->children()
+                        ->arrayNode('dbal')
+                            ->{class_exists(DoctrineBundle::class) ? 'canBeDisabled' : 'canBeEnabled'}()
+                            ->fixXmlConfig('connection')
+                            ->children()
+                                ->booleanNode('ignore_prepare_spans')->defaultFalse()->end()
+                                ->arrayNode('connections')
+                                    ->scalarPrototype()->end()
+                                ->end()
+                            ->end()
+                        ->end()
+                        ->arrayNode('twig')
+                            ->{class_exists(TwigBundle::class) ? 'canBeDisabled' : 'canBeEnabled'}()
+                        ->end()
+                        ->arrayNode('cache')
+                            ->{class_exists(CacheItem::class) ? 'canBeDisabled' : 'canBeEnabled'}()
+                        ->end()
+                        ->arrayNode('http_client')
+                            ->{class_exists(HttpClient::class) ? 'canBeDisabled' : 'canBeEnabled'}()
+                        ->end()
+                        ->arrayNode('console')
+                            ->addDefaultsIfNotSet()
+                            ->fixXmlConfig('excluded_command')
+                            ->children()
+                                ->arrayNode('excluded_commands')
+                                    ->scalarPrototype()->end()
+                                    ->defaultValue(['messenger:consume'])
+                                ->end()
+                            ->end()
+                        ->end()
+                    ->end()
+                ->end()
+            ->end();
+    }
+}

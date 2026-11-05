@@ -1,0 +1,23 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Sentry\SentryBundle\Tracing\HttpClient;
+
+/**
+ * @internal
+ */
+final class TraceableHttpClientForV5 extends AbstractTraceableHttpClient
+{
+    /**
+     * {@inheritdoc}
+     */
+    public function withOptions(array $options): self
+    {
+        $clone = clone $this;
+        $clone->client = $this->client->withOptions($options);
+        $clone->defaultHeaders = self::normalizeHeaders($options['headers'] ?? []) + $this->defaultHeaders;
+
+        return $clone;
+    }
+}

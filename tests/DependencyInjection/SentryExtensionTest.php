@@ -1,0 +1,815 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Sentry\SentryBundle\Tests\DependencyInjection;
+
+use Doctrine\Bundle\DoctrineBundle\DoctrineBundle;
+use Jean85\PrettyVersions;
+use Monolog\Handler\AbstractHandler;
+use PHPUnit\Framework\TestCase;
+use Psr\Log\NullLogger;
+use Sentry\ClientInterface;
+use Sentry\DataCollection\DataCollectionOptions;
+use Sentry\DataCollection\HttpMessageType;
+use Sentry\DataCollection\KeyValueCollectionBehavior;
+use Sentry\Integration\RequestFetcherInterface;
+use Sentry\Logger\DebugStdOutLogger;
+use Sentry\Options;
+use Sentry\SentryBundle\DependencyInjection\SentryExtension;
+use Sentry\SentryBundle\EventListener\ConsoleListener;
+use Sentry\SentryBundle\EventListener\ErrorListener;
+use Sentry\SentryBundle\EventListener\LoginListener;
+use Sentry\SentryBundle\EventListener\MessengerListener;
+use Sentry\SentryBundle\EventListener\RequestListener;
+use Sentry\SentryBundle\EventListener\RuntimeContextListener;
+use Sentry\SentryBundle\EventListener\SubRequestListener;
+use Sentry\SentryBundle\EventListener\TracingConsoleListener;
+use Sentry\SentryBundle\EventListener\TracingRequestListener;
+use Sentry\SentryBundle\EventListener\TracingSubRequestListener;
+use Sentry\SentryBundle\Integration\IntegrationConfigurator;
+use Sentry\SentryBundle\Monolog\CapturedExceptionTracker;
+use Sentry\SentryBundle\Monolog\PhpErrorHandler;
+use Sentry\SentryBundle\Monolog\UncaughtExceptionHandler;
+use Sentry\SentryBundle\SentryBundle;
+use Sentry\SentryBundle\Serializer\ConsoleInputSerializer;
+use Sentry\SentryBundle\Tracing\Doctrine\DBAL\ConnectionConfigurator;
+use Sentry\SentryBundle\Tracing\Doctrine\DBAL\TracingDriverMiddleware;
+use Sentry\SentryBundle\Tracing\Twig\TwigTracingExtension;
+use Sentry\Serializer\RepresentationSerializer;
+use Sentry\State\HubInterface;
+use Symfony\Bundle\TwigBundle\TwigBundle;
+use Symfony\Component\Console\ConsoleEvents;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\DependencyInjection\Compiler\ResolveParameterPlaceHoldersPass;
+use Symfony\Component\DependencyInjection\Compiler\ResolveTaggedIteratorArgumentPass;
+use Symfony\Component\DependencyInjection\Compiler\ValidateEnvPlaceholdersPass;
+use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\Definition;
+use Symfony\Component\DependencyInjection\ParameterBag\EnvPlaceholderParameterBag;
+use Symfony\Component\DependencyInjection\Reference;
+use Symfony\Component\HttpClient\HttpClient;
+use Symfony\Component\HttpClient\TraceableHttpClient;
+use Symfony\Component\HttpKernel\KernelEvents;
+use Symfony\Component\Messenger\Event\WorkerMessageFailedEvent;
+use Symfony\Component\Messenger\Event\WorkerMessageHandledEvent;
+use Symfony\Component\Messenger\Event\WorkerMessageReceivedEvent;
+use Symfony\Component\Messenger\MessageBusInterface;
+
+abstract class SentryExtensionTest extends TestCase
+{
+    abstract protected function loadFixture(ContainerBuilder $container, string $fixtureFile): void;
+
+    public function testErrorListener(): void
+    {
+        $container = $this->createContainerFromFixture('full');
+        $definition = $container->getDefinition(ErrorListener::class);
+
+        $this->assertSame(ErrorListener::class, $definition->getClass());
+        $this->assertSame([
+            'event' => KernelEvents::EXCEPTION,
+            'method' => 'handleExceptionEvent',
+            'priority' => 128,
+        ], $definition->getTag('kernel.event_listener')[0]);
+    }
+
+    public function testErrorListenerIsRemovedWhenDisabled(): void
+    {
+        $container = $this->createContainerFromFixture('error_listener_disabled');
+
+        $this->assertFalse($container->hasDefinition(ErrorListener::class));
+    }
+
+    /**
+     * @testWith ["full", true]
+     *           ["error_handler_disabled", false]
+     */
+    public function testIntegrationConfiguratorRegisterErrorHandlerArgument(string $fixtureFile, bool $expected): void
+    {
+        $container = $this->createContainerFromFixture($fixtureFile);
+        $definition = $container->getDefinition(IntegrationConfigurator::class);
+
+        $this->assertSame($expected, $definition->getArgument(1));
+    }
+
+    public function testMonologHandlersAreNotRegisteredByDefault(): void
+    {
+        $container = $this->createContainerFromFixture('full');
+
+        $this->assertFalse($container->hasDefinition(SentryExtension::MONOLOG_PHP_ERROR_HANDLER_SERVICE_ID));
+        $this->assertFalse($container->hasDefinition(SentryExtension::MONOLOG_UNCAUGHT_EXCEPTION_HANDLER_SERVICE_ID));
+    }
+
+    public function testMonologHandlersAreRegisteredWhenEnabled(): void
+    {
+        if (!class_exists(AbstractHandler::class)) {
+            $this->markTestSkipped('Monolog is not installed.');
+        }
+
+        $container = $this->createContainerFromFixture('monolog_handler_enabled');
+        $tracker = new Reference(SentryExtension::MONOLOG_CAPTURED_EXCEPTION_TRACKER_SERVICE_ID);
+
+        $this->assertSame(CapturedExceptionTracker::class, $container->getDefinition(SentryExtension::MONOLOG_CAPTURED_EXCEPTION_TRACKER_SERVICE_ID)->getClass());
+
+        $definition = $container->getDefinition(SentryExtension::MONOLOG_PHP_ERROR_HANDLER_SERVICE_ID);
+        $this->assertSame(PhpErrorHandler::class, $definition->getClass());
+        // Silenced errors bubble unless MonologErrorReportingPass enables the scream mode itself
+        $this->assertEquals([new Reference(HubInterface::class), $tracker, true], $definition->getArguments());
+
+        $definition = $container->getDefinition(SentryExtension::MONOLOG_UNCAUGHT_EXCEPTION_HANDLER_SERVICE_ID);
+        $this->assertSame(UncaughtExceptionHandler::class, $definition->getClass());
+        $this->assertEquals([new Reference(HubInterface::class), $tracker, false], $definition->getArguments());
+    }
+
+    public function testConsoleCommandListener(): void
+    {
+        $container = $this->createContainerFromFixture('full');
+        $definition = $container->findDefinition(ConsoleListener::class);
+
+        $this->assertSame(ConsoleListener::class, $definition->getClass());
+        $this->assertSame([
+            'kernel.event_listener' => [
+                [
+                    'event' => ConsoleEvents::COMMAND,
+                    'method' => 'handleConsoleCommandEvent',
+                    'priority' => 128,
+                ],
+                [
+                    'event' => ConsoleEvents::TERMINATE,
+                    'method' => 'handleConsoleTerminateEvent',
+                    'priority' => -64,
+                ],
+                [
+                    'event' => ConsoleEvents::ERROR,
+                    'method' => 'handleConsoleErrorEvent',
+                    'priority' => -64,
+                ],
+            ],
+        ], $definition->getTags());
+
+        $this->assertTrue($definition->getArgument(1));
+    }
+
+    public function testConsoleCommandListenerDoesNotCaptureErrorsWhenErrorListenerIsDisabled(): void
+    {
+        $container = $this->createContainerFromFixture('error_listener_disabled');
+        $definition = $container->getDefinition(ConsoleListener::class);
+
+        $this->assertFalse($definition->getArgument(1));
+    }
+
+    public function testMessengerListener(): void
+    {
+        if (!interface_exists(MessageBusInterface::class)) {
+            $this->markTestSkipped('This test requires the "symfony/messenger" Composer package to be installed.');
+        }
+
+        $container = $this->createContainerFromFixture('full');
+        $definition = $container->getDefinition(MessengerListener::class);
+
+        $this->assertSame(MessengerListener::class, $definition->getClass());
+        $this->assertSame([
+            'kernel.event_listener' => [
+                [
+                    'event' => WorkerMessageFailedEvent::class,
+                    'method' => 'handleWorkerMessageFailedEvent',
+                    'priority' => 50,
+                ],
+                [
+                    'event' => WorkerMessageHandledEvent::class,
+                    'method' => 'handleWorkerMessageHandledEvent',
+                    'priority' => 50,
+                ],
+                [
+                    'event' => WorkerMessageReceivedEvent::class,
+                    'method' => 'handleWorkerMessageReceivedEvent',
+                    'priority' => 50,
+                ],
+            ],
+        ], $definition->getTags());
+
+        $this->assertFalse($definition->getArgument(1));
+        $this->assertTrue($definition->getArgument(2));
+        $this->assertTrue($definition->getArgument(3));
+    }
+
+    public function testMessengerListenerIsRemovedWhenDisabled(): void
+    {
+        $container = $this->createContainerFromFixture('messenger_listener_disabled');
+
+        $this->assertFalse($container->hasDefinition(MessengerListener::class));
+    }
+
+    public function testRequestListener(): void
+    {
+        $container = $this->createContainerFromFixture('full');
+        $definition = $container->getDefinition(RequestListener::class);
+
+        $this->assertSame(RequestListener::class, $definition->getClass());
+        $this->assertSame([
+            'kernel.event_listener' => [
+                [
+                    'event' => KernelEvents::REQUEST,
+                    'method' => 'handleKernelRequestEvent',
+                    'priority' => 64,
+                ],
+                [
+                    'event' => KernelEvents::CONTROLLER,
+                    'method' => 'handleKernelControllerEvent',
+                    'priority' => 10,
+                ],
+            ],
+        ], $definition->getTags());
+    }
+
+    /**
+     * The user context must be filled before any listener that can throw, otherwise
+     * RequestIntegration falls back to $_SERVER['REMOTE_ADDR'] - which behind a reverse
+     * proxy is the proxy itself, not the client. The router (priority 32) throws
+     * NotFoundHttpException on every unknown URL, so a 404 would be attributed to the
+     * proxy while a controller-thrown 404 on the same site would not.
+     */
+    public function testRequestListenerFillsUserContextBeforeTheRouterCanThrow(): void
+    {
+        $container = $this->createContainerFromFixture('full');
+        $tags = $container->getDefinition(RequestListener::class)->getTag('kernel.event_listener');
+
+        $requestPriority = null;
+
+        foreach ($tags as $attributes) {
+            if (KernelEvents::REQUEST === ($attributes['event'] ?? null)) {
+                $requestPriority = $attributes['priority'];
+            }
+        }
+
+        $this->assertNotNull($requestPriority);
+        // RouterListener runs at priority 32
+        $this->assertGreaterThan(32, $requestPriority);
+        // ValidateRequestListener runs at priority 256 and rejects conflicting forwarded
+        // headers; getClientIp() must not be reached before it has had its say.
+        $this->assertLessThan(256, $requestPriority);
+    }
+
+    public function testRuntimeContextListener(): void
+    {
+        $container = $this->createContainerFromFixture('full');
+        $definition = $container->getDefinition(RuntimeContextListener::class);
+
+        $this->assertSame(RuntimeContextListener::class, $definition->getClass());
+        // Keep this dependency explicit: removing it can break runtime-context bootstrap
+        // in some long-running/no-optional package environments.
+        $this->assertEquals(new Reference(HubInterface::class), $definition->getArgument(0));
+        $this->assertSame([
+            'kernel.event_listener' => [
+                [
+                    'event' => KernelEvents::REQUEST,
+                    'method' => 'handleKernelRequestEvent',
+                    'priority' => 512,
+                ],
+                [
+                    'event' => KernelEvents::TERMINATE,
+                    'method' => 'handleKernelTerminateEvent',
+                    'priority' => -128,
+                ],
+            ],
+            'kernel.reset' => [
+                ['method' => 'reset'],
+            ],
+        ], $definition->getTags());
+    }
+
+    /**
+     * The runtime context must start before any listener that can write to the hub,
+     * e.g. the router (priority 32) and the security firewall (priority 8) emit log
+     * records that monolog integrations turn into breadcrumbs. Before the context
+     * starts these land on the shared base hub, whose scope is cloned into every new
+     * context - on persistent workers they would leak across requests.
+     */
+    public function testRuntimeContextListenerStartsBeforeAnyListenerThatCanEmitLogs(): void
+    {
+        $container = $this->createContainerFromFixture('full');
+        $tags = $container->getDefinition(RuntimeContextListener::class)->getTag('kernel.event_listener');
+
+        $requestPriority = null;
+
+        foreach ($tags as $attributes) {
+            if (KernelEvents::REQUEST === ($attributes['event'] ?? null)) {
+                $requestPriority = $attributes['priority'];
+            }
+        }
+
+        $this->assertNotNull($requestPriority);
+        // RouterListener (priority 32) is the earliest core listener emitting log records
+        $this->assertGreaterThan(32, $requestPriority);
+    }
+
+    public function testSubRequestListener(): void
+    {
+        $container = $this->createContainerFromFixture('full');
+        $definition = $container->getDefinition(SubRequestListener::class);
+
+        $this->assertSame(SubRequestListener::class, $definition->getClass());
+        $this->assertSame([
+            'kernel.event_listener' => [
+                [
+                    'event' => KernelEvents::REQUEST,
+                    'method' => 'handleKernelRequestEvent',
+                    'priority' => 3,
+                ],
+                [
+                    'event' => KernelEvents::FINISH_REQUEST,
+                    'method' => 'handleKernelFinishRequestEvent',
+                    'priority' => 5,
+                ],
+            ],
+        ], $definition->getTags());
+    }
+
+    /**
+     * The session listener can still add the session cookie to the response,
+     * so the response data must be collected after it but before the streamed
+     * response listener of Symfony < 7.0 sends the response.
+     */
+    public function testTracingListenersCollectResponseDataAfterTheSessionListener(): void
+    {
+        $container = $this->createContainerFromFixture('full');
+
+        foreach ([TracingRequestListener::class, TracingSubRequestListener::class] as $listener) {
+            $collectPriority = null;
+
+            foreach ($container->getDefinition($listener)->getTag('kernel.event_listener') as $attributes) {
+                if ('collectKernelResponseData' !== ($attributes['method'] ?? null)) {
+                    continue;
+                }
+
+                $this->assertSame(KernelEvents::RESPONSE, $attributes['event'] ?? null);
+                $collectPriority = $attributes['priority'];
+            }
+
+            $this->assertNotNull($collectPriority);
+            // SessionListener runs at priority -1000
+            $this->assertLessThan(-1000, $collectPriority);
+            // StreamedResponseListener runs at priority -1024
+            $this->assertGreaterThan(-1024, $collectPriority);
+        }
+    }
+
+    public function testRequestFetcherIsResettable(): void
+    {
+        $container = $this->createContainerFromFixture('full');
+        $definition = $container->getDefinition(RequestFetcherInterface::class);
+
+        $this->assertSame([
+            ['method' => 'reset'],
+        ], $definition->getTag('kernel.reset'));
+    }
+
+    public function testClientIsCreatedFromOptions(): void
+    {
+        $container = $this->createContainerFromFixture('full');
+        $optionsDefinition = $container->getDefinition('sentry.client.options');
+        $expectedOptions = [
+            'dsn' => 'https://examplePublicKey@o0.ingest.sentry.io/0',
+            'integrations' => new Reference(IntegrationConfigurator::class),
+            'default_integrations' => false,
+            'prefixes' => [$container->getParameter('kernel.project_dir')],
+            'sample_rate' => 1,
+            'enable_tracing' => true,
+            'traces_sample_rate' => 1,
+            'traces_sampler' => new Reference('App\\Sentry\\Tracing\\TracesSampler'),
+            'profiles_sample_rate' => 1,
+            'enable_logs' => true,
+            'log_flush_threshold' => 2,
+            'enable_metrics' => true,
+            'attach_stacktrace' => true,
+            'attach_metric_code_locations' => true,
+            'context_lines' => 0,
+            'environment' => 'development',
+            'logger' => new Reference(DebugStdOutLogger::class),
+            'spotlight' => true,
+            'spotlight_url' => 'http://localhost:8969',
+            'release' => '4.0.x-dev',
+            'org_id' => 1,
+            'server_name' => 'localhost',
+            'ignore_exceptions' => [
+                'Symfony\Component\HttpKernel\Exception\BadRequestHttpException',
+            ],
+            'ignore_transactions' => [
+                'GET tracing_ignored_transaction',
+            ],
+            'before_send' => new Reference('App\\Sentry\\BeforeSendCallback'),
+            'before_send_transaction' => new Reference('App\\Sentry\\BeforeSendTransactionCallback'),
+            'before_send_check_in' => new Reference('App\\Sentry\\BeforeSendCheckInCallback'),
+            'before_send_metrics' => new Reference('App\\Sentry\\BeforeSendMetricsCallback'),
+            'before_send_log' => new Reference('App\\Sentry\\BeforeSendLogsCallback'),
+            'trace_propagation_targets' => ['website.invalid'],
+            'strict_trace_continuation' => true,
+            'tags' => [
+                'context' => 'development',
+            ],
+            'error_types' => \E_ALL,
+            'max_breadcrumbs' => 1,
+            'before_breadcrumb' => new Reference('App\\Sentry\\BeforeBreadcrumbCallback'),
+            'in_app_exclude' => [$container->getParameter('kernel.cache_dir')],
+            'in_app_include' => [$container->getParameter('kernel.project_dir')],
+            'send_default_pii' => true,
+            'data_collection' => [
+                'user_info' => false,
+                'cookies' => [
+                    'mode' => 'allowList',
+                    'terms' => ['theme'],
+                ],
+                'http_headers' => [
+                    'request' => [
+                        'mode' => 'denyList',
+                        'terms' => ['x-forwarded-for'],
+                    ],
+                    'response' => [
+                        'mode' => 'off',
+                        'terms' => [],
+                    ],
+                ],
+                'http_bodies' => ['incomingRequest', 'outgoingRequest'],
+                'url_query_params' => [
+                    'terms' => ['email'],
+                ],
+                'gen_ai' => [
+                    'inputs' => false,
+                    'outputs' => true,
+                ],
+                'database_query_data' => false,
+                'queues' => false,
+                'stack_frame_variables' => [
+                    'mode' => 'allowList',
+                    'terms' => ['id'],
+                ],
+                'frame_context_lines' => 3,
+            ],
+            'max_value_length' => 255,
+            'transport' => new Reference('App\\Sentry\\Transport'),
+            'http_client' => new Reference('App\\Sentry\\HttpClient'),
+            'http_proxy' => 'proxy.example.com:8080',
+            'http_proxy_authentication' => 'user:password',
+            'http_timeout' => 10,
+            'http_connect_timeout' => 15,
+            'http_ssl_verify_peer' => true,
+            'http_compression' => true,
+            'capture_silenced_errors' => true,
+            'max_request_body_size' => 'none',
+            'class_serializers' => [
+                'App\\FooClass' => new Reference('App\\Sentry\\Serializer\\FooClassSerializer'),
+            ],
+        ];
+
+        $this->assertSame(Options::class, $optionsDefinition->getClass());
+        $this->assertEquals($expectedOptions, $optionsDefinition->getArgument(0));
+
+        $integrationConfiguratorDefinition = $container->getDefinition(IntegrationConfigurator::class);
+        $expectedIntegrations = [
+            new Reference('App\\Sentry\\Integration\\FooIntegration'),
+            new Reference('Sentry\\Integration\\OTLPIntegration'),
+        ];
+
+        $this->assertSame(IntegrationConfigurator::class, $integrationConfiguratorDefinition->getClass());
+        $this->assertEquals($expectedIntegrations, $integrationConfiguratorDefinition->getArgument(0));
+
+        $clientDefinition = $container->findDefinition(ClientInterface::class);
+        $factory = $clientDefinition->getFactory();
+
+        $this->assertIsArray($factory);
+        $this->assertInstanceOf(Definition::class, $factory[0]);
+        $this->assertSame('getClient', $factory[1]);
+
+        $methodCalls = $factory[0]->getMethodCalls();
+
+        $this->assertCount(4, $methodCalls);
+        $this->assertDefinitionMethodCallAt($methodCalls[0], 'setSdkIdentifier', [SentryBundle::SDK_IDENTIFIER]);
+        $this->assertDefinitionMethodCallAt($methodCalls[1], 'setSdkVersion', [SentryBundle::SDK_VERSION]);
+        $this->assertDefinitionMethodCallAt($methodCalls[3], 'setLogger', [new Reference('app.logger')]);
+
+        $this->assertSame('setRepresentationSerializer', $methodCalls[2][0]);
+        $this->assertInstanceOf(Definition::class, $methodCalls[2][1][0]);
+        $this->assertSame(RepresentationSerializer::class, $methodCalls[2][1][0]->getClass());
+        $this->assertEquals($methodCalls[2][1][0]->getArgument(0), new Reference('sentry.client.options'));
+    }
+
+    public function testDataCollectionOptionIsAcceptedByTheSdk(): void
+    {
+        $container = $this->createContainerFromFixture('full');
+        $dataCollection = $this->createDataCollectionOptions($container);
+
+        $this->assertFalse($dataCollection->shouldCollectUserInfo());
+        $this->assertEquals(KeyValueCollectionBehavior::allowList(['theme']), $dataCollection->getCookies());
+        $this->assertEquals([
+            'request' => KeyValueCollectionBehavior::denyList(['x-forwarded-for']),
+            'response' => KeyValueCollectionBehavior::off(),
+        ], $dataCollection->getHttpHeaders());
+        $this->assertSame([HttpMessageType::incomingRequest(), HttpMessageType::outgoingRequest()], $dataCollection->getHttpBodies());
+        $this->assertEquals(KeyValueCollectionBehavior::denyList(['email']), $dataCollection->getUrlQueryParams());
+        $this->assertSame(['inputs' => false, 'outputs' => true], $dataCollection->getGenAi());
+        $this->assertFalse($dataCollection->shouldCollectDatabaseQueryData());
+        $this->assertFalse($dataCollection->shouldCollectQueues());
+        $this->assertEquals(KeyValueCollectionBehavior::allowList(['id']), $dataCollection->getStackFrameVariables());
+        $this->assertSame(3, $dataCollection->getFrameContextLines());
+    }
+
+    public function testDataCollectionShorthandsAreExpanded(): void
+    {
+        $container = $this->createContainerFromFixture('data_collection_shorthand');
+        /** @var array{data_collection: array<string, mixed>} $options */
+        $options = $container->getDefinition('sentry.client.options')->getArgument(0);
+
+        $this->assertEquals([
+            'http_headers' => [
+                'request' => [
+                    'mode' => 'allowList',
+                    'terms' => ['x-request-id'],
+                ],
+                'response' => [
+                    'mode' => 'allowList',
+                    'terms' => ['x-request-id'],
+                ],
+            ],
+            'http_bodies' => [],
+            'stack_frame_variables' => [
+                'mode' => 'off',
+                'terms' => [],
+            ],
+        ], $options['data_collection']);
+
+        $dataCollection = $this->createDataCollectionOptions($container);
+
+        $this->assertEquals([
+            'request' => KeyValueCollectionBehavior::allowList(['x-request-id']),
+            'response' => KeyValueCollectionBehavior::allowList(['x-request-id']),
+        ], $dataCollection->getHttpHeaders());
+        $this->assertSame([], $dataCollection->getHttpBodies());
+        $this->assertEquals(KeyValueCollectionBehavior::off(), $dataCollection->getStackFrameVariables());
+    }
+
+    /**
+     * @testWith ["data_collection_null"]
+     *           ["dsn_null"]
+     */
+    public function testDataCollectionOptionIsNotSetUnlessConfigured(string $fixtureFile): void
+    {
+        $container = $this->createContainerFromFixture($fixtureFile);
+        /** @var array<string, mixed> $options */
+        $options = $container->getDefinition('sentry.client.options')->getArgument(0);
+
+        $this->assertArrayNotHasKey('data_collection', $options);
+    }
+
+    public function testErrorTypesOptionIsParsedFromStringToIntegerValue(): void
+    {
+        $container = $this->createContainerFromFixture('error_types');
+        $optionsDefinition = $container->getDefinition('sentry.client.options');
+
+        // 2048 is \E_STRICT which has been deprecated in PHP 8.4 so we should not reference it directly to prevent deprecation notices
+        $this->assertSame(\E_ALL & ~(\E_NOTICE | 2048 | \E_DEPRECATED), $optionsDefinition->getArgument(0)['error_types']);
+    }
+
+    public function testConsoleInputSerializerIsRegisteredAndResolvesAsClassSerializer(): void
+    {
+        $container = $this->createContainerFromFixture('console_input_serializer');
+
+        $this->assertTrue($container->hasDefinition(ConsoleInputSerializer::class));
+
+        $optionsDefinition = $container->getDefinition('sentry.client.options');
+        $classSerializers = $optionsDefinition->getArgument(0)['class_serializers'];
+
+        $this->assertArrayHasKey(InputInterface::class, $classSerializers);
+        $this->assertEquals(new Reference(ConsoleInputSerializer::class), $classSerializers[InputInterface::class]);
+    }
+
+    /**
+     * @dataProvider dsnOptionIsSetOnClientOptionsDataProvider
+     *
+     * @param mixed $expectedResult
+     */
+    public function testDsnOptionIsSetOnClientOptions(string $fixtureFile, $expectedResult): void
+    {
+        $container = $this->createContainerFromFixture($fixtureFile);
+        $optionsDefinition = $container->getDefinition('sentry.client.options');
+
+        $this->assertSame(Options::class, $optionsDefinition->getClass());
+        $this->assertSame($expectedResult, $optionsDefinition->getArgument(0)['dsn']);
+    }
+
+    /**
+     * @return \Generator<mixed>
+     */
+    public function dsnOptionIsSetOnClientOptionsDataProvider(): \Generator
+    {
+        yield [
+            'dsn_empty_string',
+            '',
+        ];
+
+        yield [
+            'dsn_false',
+            false,
+        ];
+
+        yield [
+            'dsn_null',
+            null,
+        ];
+    }
+
+    public function testInstrumentationIsDisabledWhenTracingIsDisabled(): void
+    {
+        $container = $this->createContainerFromFixture('tracing_disabled');
+
+        $this->assertFalse($container->hasDefinition(TracingRequestListener::class));
+        $this->assertFalse($container->hasDefinition(TracingSubRequestListener::class));
+        $this->assertFalse($container->hasDefinition(TracingConsoleListener::class));
+        $this->assertFalse($container->hasDefinition(TracingDriverMiddleware::class));
+        $this->assertFalse($container->hasDefinition(ConnectionConfigurator::class));
+        $this->assertFalse($container->hasDefinition(TwigTracingExtension::class));
+        $this->assertFalse($container->hasDefinition(TraceableHttpClient::class));
+        $this->assertFalse($container->getParameter('sentry.tracing.enabled'));
+        $this->assertEmpty($container->getParameter('sentry.tracing.dbal.connections'));
+    }
+
+    public function testTracingDriverMiddlewareIsConfiguredWhenDbalTracingIsEnabled(): void
+    {
+        if (!class_exists(DoctrineBundle::class)) {
+            $this->expectException(\LogicException::class);
+            $this->expectExceptionMessage('DBAL tracing support cannot be enabled because the doctrine/doctrine-bundle Composer package is not installed.');
+        }
+
+        $container = $this->createContainerFromFixture('dbal_tracing_enabled');
+
+        $this->assertTrue($container->hasDefinition(TracingDriverMiddleware::class));
+        $this->assertTrue($container->hasDefinition(ConnectionConfigurator::class));
+        $this->assertNotEmpty($container->getParameter('sentry.tracing.dbal.connections'));
+    }
+
+    public function testTracingDriverConnectionFactoryReceivesIgnorePrepareSpansFlag(): void
+    {
+        if (!class_exists(DoctrineBundle::class)) {
+            $this->expectException(\LogicException::class);
+            $this->expectExceptionMessage('DBAL tracing support cannot be enabled because the doctrine/doctrine-bundle Composer package is not installed.');
+        }
+
+        $container = $this->createContainerFromFixture('dbal_tracing_enabled');
+        $definition = $container->getDefinition('sentry.tracing.dbal.connection_factory');
+
+        $this->assertTrue($definition->getArgument(1));
+    }
+
+    public function testTracingDriverMiddlewareIsRemovedWhenDbalTracingIsDisabled(): void
+    {
+        $container = $this->createContainerFromFixture('full');
+
+        $this->assertFalse($container->hasDefinition(TracingDriverMiddleware::class));
+        $this->assertFalse($container->hasDefinition(ConnectionConfigurator::class));
+        $this->assertEmpty($container->getParameter('sentry.tracing.dbal.connections'));
+    }
+
+    public function testTwigTracingExtensionIsConfiguredWhenTwigTracingIsEnabled(): void
+    {
+        if (!class_exists(TwigBundle::class)) {
+            $this->expectException(\LogicException::class);
+            $this->expectExceptionMessage('Twig tracing support cannot be enabled because the symfony/twig-bundle Composer package is not installed.');
+        }
+
+        $container = $this->createContainerFromFixture('twig_tracing_enabled');
+
+        $this->assertTrue($container->hasDefinition(TwigTracingExtension::class));
+    }
+
+    public function testHttpClientTracingExtensionIsConfiguredWhenHttpClientTracingIsEnabled(): void
+    {
+        if (!class_exists(HttpClient::class)) {
+            $this->expectException(\LogicException::class);
+            $this->expectExceptionMessage('Http client tracing support cannot be enabled because the symfony/http-client Composer package is not installed.');
+        }
+
+        $container = $this->createContainerFromFixture('http_client_tracing_enabled');
+
+        $this->assertTrue($container->getParameter('sentry.tracing.http_client.enabled'));
+    }
+
+    public function testTwigTracingExtensionIsRemovedWhenTwigTracingIsDisabled(): void
+    {
+        $container = $this->createContainerFromFixture('full');
+
+        $this->assertFalse($container->hasDefinition(TwigTracingExtension::class));
+    }
+
+    public function testConsoleTracingListenerIsConfiguredWhenTracingIsEnabled(): void
+    {
+        $container = $this->createContainerFromFixture('console_tracing_enabled');
+
+        $this->assertTrue($container->hasDefinition(TracingConsoleListener::class));
+        $this->assertSame(['foo:bar', 'bar:foo'], $container->getDefinition(TracingConsoleListener::class)->getArgument(1));
+    }
+
+    public function testLoggerOptionFallbackToNullLoggerIfNotSet(): void
+    {
+        $container = $this->createContainerFromFixture('logger_service_not_set');
+        $clientDefinition = $container->findDefinition(ClientInterface::class);
+        $factory = $clientDefinition->getFactory();
+
+        $this->assertIsArray($factory);
+
+        $methodCalls = $factory[0]->getMethodCalls();
+
+        $this->assertDefinitionMethodCallAt($methodCalls[3], 'setLogger', [new Reference(NullLogger::class, ContainerBuilder::IGNORE_ON_INVALID_REFERENCE)]);
+    }
+
+    public function testLoginListener(): void
+    {
+        $container = $this->createContainerFromFixture('full');
+        $this->assertTrue($container->hasDefinition(LoginListener::class));
+    }
+
+    /**
+     * @dataProvider releaseOptionDataProvider
+     */
+    public function testReleaseOption(string $fixtureFile, string $expectedRelease): void
+    {
+        $container = $this->createContainerFromFixture($fixtureFile);
+        $optionsDefinition = $container->getDefinition('sentry.client.options');
+
+        $this->assertSame(Options::class, $optionsDefinition->getClass());
+        $this->assertSame($expectedRelease, $container->resolveEnvPlaceholders($optionsDefinition->getArgument(0)['release'], true));
+    }
+
+    public function releaseOptionDataProvider(): \Generator
+    {
+        yield 'If the release option is set to a concrete value, then no fallback occurs' => [
+            'release_option_from_config',
+            '1.0.x-dev',
+        ];
+
+        yield 'If the release option is set and references an environment variable, then no fallback occurs' => [
+            'release_option_from_env_var',
+            '1.0.x-dev',
+        ];
+
+        yield 'If the release option is unset and the SENTRY_RELEASE environment variable is set, then the latter is used as fallback' => [
+            'release_option_fallback_to_env_var',
+            '1.0.x-dev',
+        ];
+
+        yield 'If both the release option and the SENTRY_RELEASE environment variable are unset, then the root package version is used as fallback' => [
+            'release_option_fallback_to_composer_version',
+            PrettyVersions::getRootPackageVersion()->getPrettyVersion(),
+        ];
+    }
+
+    private function createContainerFromFixture(string $fixtureFile): ContainerBuilder
+    {
+        $container = new ContainerBuilder(new EnvPlaceholderParameterBag([
+            'kernel.cache_dir' => __DIR__,
+            'kernel.build_dir' => __DIR__,
+            'kernel.project_dir' => __DIR__,
+            'kernel.environment' => 'dev',
+            'doctrine.default_connection' => 'default',
+            'doctrine.connections' => ['default'],
+        ]));
+
+        $container->registerExtension(new SentryExtension());
+        $container->getCompilerPassConfig()->setRemovingPasses([]);
+        $container->getCompilerPassConfig()->setAfterRemovingPasses([]);
+        $container->getCompilerPassConfig()->setOptimizationPasses([
+            new ValidateEnvPlaceholdersPass(),
+            new ResolveParameterPlaceHoldersPass(),
+            new ResolveTaggedIteratorArgumentPass(),
+        ]);
+
+        $this->loadFixture($container, $fixtureFile);
+
+        $container->compile();
+
+        return $container;
+    }
+
+    /**
+     * The SDK silently falls back to its defaults for values it does not accept, so the
+     * configuration passed by the bundle is resolved by the SDK to ensure it is applied.
+     */
+    private function createDataCollectionOptions(ContainerBuilder $container): DataCollectionOptions
+    {
+        /** @var array{data_collection: array<string, mixed>} $options */
+        $options = $container->getDefinition('sentry.client.options')->getArgument(0);
+        $dataCollection = (new Options(['data_collection' => $options['data_collection']]))->getDataCollection();
+
+        $this->assertNotNull($dataCollection);
+
+        return $dataCollection;
+    }
+
+    /**
+     * @param array<int, mixed> $methodCall
+     * @param mixed[]           $arguments
+     */
+    private function assertDefinitionMethodCallAt(array $methodCall, string $method, array $arguments): void
+    {
+        $this->assertSame($method, $methodCall[0]);
+        $this->assertEquals($arguments, $methodCall[1]);
+    }
+}

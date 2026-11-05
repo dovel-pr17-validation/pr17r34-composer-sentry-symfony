@@ -1,0 +1,101 @@
+<?xml version="1.0" ?>
+
+<container xmlns="http://symfony.com/schema/dic/services"
+           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+           xmlns:sentry="https://sentry.io/schema/dic/sentry-symfony"
+           xsi:schemaLocation="http://symfony.com/schema/dic/services https://symfony.com/schema/dic/services/services-1.0.xsd
+                               https://sentry.io/schema/dic/sentry-symfony https://sentry.io/schema/dic/sentry-symfony/sentry-1.0.xsd">
+
+    <sentry:config
+        dsn="https://examplePublicKey@o0.ingest.sentry.io/0"
+        logger="app.logger"
+    >
+        <sentry:options default-integrations="false"
+                        sample-rate="1"
+                        enable-tracing="true"
+                        enable-logs="true"
+                        log-flush-threshold="2"
+                        traces-sample-rate="1"
+                        traces-sampler="App\Sentry\Tracing\TracesSampler"
+                        profiles-sample-rate="1"
+                        attach-stacktrace="true"
+                        attach-metric-code-locations="true"
+                        context-lines="0"
+                        environment="development"
+                        logger="Sentry\Logger\DebugStdOutLogger"
+                        spotlight="true"
+                        spotlight-url="http://localhost:8969"
+                        release="4.0.x-dev"
+                        org-id="1"
+                        server-name="localhost"
+                        before-send="App\Sentry\BeforeSendCallback"
+                        before-send-transaction="App\Sentry\BeforeSendTransactionCallback"
+                        before-send-check-in="App\Sentry\BeforeSendCheckInCallback"
+                        before-send-metrics="App\Sentry\BeforeSendMetricsCallback"
+                        before-send-log="App\Sentry\BeforeSendLogsCallback"
+                        error-types="E_ALL"
+                        max-breadcrumbs="1"
+                        before-breadcrumb="App\Sentry\BeforeBreadcrumbCallback"
+                        send-default-pii="true"
+                        max-value-length="255"
+                        transport="App\Sentry\Transport"
+                        http-client="App\Sentry\HttpClient"
+                        http-proxy="proxy.example.com:8080"
+                        http-proxy-authentication="user:password"
+                        http-connect-timeout="15"
+                        http-timeout="10"
+                        http-ssl-verify-peer="true"
+                        http-compression="true"
+                        capture-silenced-errors="true"
+                        max-request-body-size="none"
+                        strict-trace-continuation="true"
+        >
+            <sentry:integration>App\Sentry\Integration\FooIntegration</sentry:integration>
+            <sentry:integration>Sentry\Integration\OTLPIntegration</sentry:integration>
+            <sentry:trace-propagation-target>website.invalid</sentry:trace-propagation-target>
+            <sentry:prefix>%kernel.project_dir%</sentry:prefix>
+            <sentry:tag name="context">development</sentry:tag>
+            <sentry:in-app-exclude>%kernel.cache_dir%</sentry:in-app-exclude>
+            <sentry:in-app-include>%kernel.project_dir%</sentry:in-app-include>
+            <sentry:class-serializer class="App\FooClass">App\Sentry\Serializer\FooClassSerializer</sentry:class-serializer>
+            <sentry:ignore-exception>Symfony\Component\HttpKernel\Exception\BadRequestHttpException</sentry:ignore-exception>
+            <sentry:ignore-transaction>GET tracing_ignored_transaction</sentry:ignore-transaction>
+            <sentry:data-collection user-info="false"
+                                    database-query-data="false"
+                                    queues="false"
+                                    frame-context-lines="3"
+            >
+                <sentry:cookies mode="allowList">
+                    <sentry:term>theme</sentry:term>
+                </sentry:cookies>
+                <sentry:http-headers>
+                    <sentry:request mode="denyList">
+                        <sentry:term>x-forwarded-for</sentry:term>
+                    </sentry:request>
+                    <sentry:response mode="off" />
+                </sentry:http-headers>
+                <sentry:http-body>incomingRequest</sentry:http-body>
+                <sentry:http-body>outgoingRequest</sentry:http-body>
+                <sentry:url-query-params>
+                    <sentry:term>email</sentry:term>
+                </sentry:url-query-params>
+                <sentry:gen-ai inputs="false" outputs="true" />
+                <sentry:stack-frame-variables mode="allowList">
+                    <sentry:term>id</sentry:term>
+                </sentry:stack-frame-variables>
+            </sentry:data-collection>
+        </sentry:options>
+        <sentry:messenger enabled="true" capture-soft-fails="false" isolate-breadcrumbs-by-message="true" isolate-context-by-message="true"/>
+        <sentry:tracing>
+            <sentry:dbal enabled="false">
+                <sentry:connection>default</sentry:connection>
+            </sentry:dbal>
+            <sentry:twig enabled="false" />
+            <sentry:cache enabled="false" />
+            <sentry:http-client enabled="false" />
+            <sentry:console>
+                <sentry:excluded-command>app:command</sentry:excluded-command>
+            </sentry:console>
+        </sentry:tracing>
+    </sentry:config>
+</container>

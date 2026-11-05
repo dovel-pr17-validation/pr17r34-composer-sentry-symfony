@@ -1,0 +1,3 @@
+sentry:
+    options:
+        error_types: E_ALL & ~(E_NOTICE|2048|E_DEPRECATED)
